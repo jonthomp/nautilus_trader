@@ -13,7 +13,14 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{cell::RefCell, collections::HashSet, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashSet,
+    future::Future,
+    pin::pin,
+    rc::Rc,
+    task::{Context, Poll, Waker},
+};
 
 use jiff::{Timestamp, civil::Date, tz::Offset};
 use nautilus_common::{
@@ -27,6 +34,7 @@ use nautilus_common::{
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_execution::{
+    engine::ExecutionEngine,
     matching_engine::{OrderMatchingEngine, config::OrderMatchingEngineConfig},
     models::{
         fee::{CappedOptionFeeModel, FeeModelAny, FixedFeeModel},
@@ -34,6 +42,7 @@ use nautilus_execution::{
     },
 };
 use nautilus_model::{
+    accounts::CashAccount,
     data::{
         Bar, BarType, BookOrder, DEPTH10_LEN, IndexPriceUpdate, InstrumentClose, OptionGreeks,
         OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
@@ -42,8 +51,8 @@ use nautilus_model::{
     enums::{
         AccountType, AggressorSide, AssetClass, BookAction, BookType, ContingencyType,
         InstrumentCloseType, LiquiditySide, MarketStatus, MarketStatusAction, OmsType, OptionKind,
-        OrderSide, OrderStatus, OrderType, RecordFlag, TimeInForce, TrailingOffsetType,
-        TriggerType,
+        OrderSide, OrderStatus, OrderType, PositionSide, RecordFlag, TimeInForce,
+        TrailingOffsetType, TriggerType,
     },
     events::{
         OrderEmulated, OrderEventAny, OrderEventType, OrderFilled, OrderRejected, OrderReleased,
@@ -82,6 +91,16 @@ fn utc_timestamp(year: i16, month: i8, day: i8, hour: i8, minute: i8, second: i8
                 .at(hour, minute, second, 0),
         )
         .unwrap()
+}
+
+fn poll_ready<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(output) => output,
+        Poll::Pending => panic!("Test database future unexpectedly yielded"),
+    }
 }
 
 #[fixture]
@@ -13949,14 +13968,11 @@ fn test_reset_restores_market_status_after_option_expiry(account_id: AccountId) 
     assert_eq!(engine.market_status, MarketStatus::Open);
 }
 
-#[rstest]
-#[case(None, "0.00")]
-#[case(Some("7.50"), "7.50")]
-fn test_option_physical_settlement_delivers_underlying(
+fn run_option_physical_settlement_case(
     account_id: AccountId,
-    #[case] close_price: Option<&str>,
-    #[case] expected_option_price: &str,
-) {
+    close_price: Option<&str>,
+    expected_option_price: &str,
+) -> [String; 6] {
     let cache = Rc::new(RefCell::new(Cache::default()));
     let order_event_handler = order_event_handler_with_cache(cache.clone());
 
@@ -14035,12 +14051,14 @@ fn test_option_physical_settlement_delivers_underlying(
         assert_full_width_independent_settlement_ids(&events, close_client_order_id, venue);
     let open_ids =
         assert_full_width_independent_settlement_ids(&events, open_client_order_id, venue);
+    let settlement_ids: [String; 6] = close_ids
+        .into_iter()
+        .chain(open_ids)
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("Expected six physical settlement IDs");
     assert_eq!(
-        close_ids
-            .into_iter()
-            .chain(open_ids)
-            .collect::<HashSet<_>>()
-            .len(),
+        settlement_ids.iter().collect::<HashSet<_>>().len(),
         6,
         "Physical settlement leg IDs must all be independent",
     );
@@ -14072,6 +14090,287 @@ fn test_option_physical_settlement_delivers_underlying(
     assert_eq!(underlying_fill.order_side, OrderSide::Buy);
     assert_eq!(underlying_fill.last_px, Price::from("149.00"));
     assert_eq!(underlying_fill.position_id, None);
+
+    settlement_ids
+}
+
+#[rstest]
+#[case(None, "0.00")]
+#[case(Some("7.50"), "7.50")]
+fn test_option_physical_settlement_delivers_underlying(
+    account_id: AccountId,
+    #[case] close_price: Option<&str>,
+    #[case] expected_option_price: &str,
+) {
+    run_option_physical_settlement_case(account_id, close_price, expected_option_price);
+}
+
+#[rstest]
+fn test_option_physical_settlement_ids_stable_across_replay(account_id: AccountId) {
+    let first = run_option_physical_settlement_case(account_id, None, "0.00");
+    let second = run_option_physical_settlement_case(account_id, None, "0.00");
+
+    assert_eq!(first, second);
+}
+
+#[rstest]
+#[case::before_option_close(Some(0), None)]
+#[case::after_option_close(Some(1), None)]
+#[case::during_second_order_registration(None, Some(2))]
+fn test_option_physical_settlement_resumes_underlying_delivery_after_restart(
+    account_id: AccountId,
+    #[case] fills_before_crash: Option<usize>,
+    #[case] fail_add_order_on: Option<usize>,
+) {
+    let (database, database_control) = FailNthAddOrderDatabase::create();
+    let cache = Rc::new(RefCell::new(Cache::new(None, Some(Box::new(database)))));
+
+    let venue = "OPRA";
+    let expiration_ns = UnixNanos::from(2_000_000_000_000_000_000u64);
+    let option = InstrumentAny::OptionContract(option_contract(
+        "AAPL",
+        venue,
+        expiration_ns,
+        OptionKind::Call,
+    ));
+    let underlying = InstrumentAny::Equity(underlying_equity(venue));
+
+    cache.borrow_mut().add_instrument(option.clone()).unwrap();
+    cache
+        .borrow_mut()
+        .add_instrument(underlying.clone())
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_account(CashAccount::default().into())
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_trade(TradeTick::new(
+            underlying.id(),
+            Price::from("160.00"),
+            Quantity::from(1),
+            AggressorSide::NoAggressor,
+            TradeId::from("U-RESTART-1"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        ))
+        .unwrap();
+    let option_position = open_long_option_position(
+        &cache,
+        &option,
+        account_id,
+        Quantity::from(1),
+        Price::from("5.00"),
+    );
+
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    clock.borrow_mut().set_time(expiration_ns);
+    let execution_engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    let process_events = Rc::new(Cell::new(true));
+    let fills_remaining = Rc::new(Cell::new(fills_before_crash));
+    let execution_engine_for_handler = execution_engine.clone();
+    let process_events_for_handler = process_events;
+    let fills_remaining_for_handler = fills_remaining;
+    let mut matching_engine = OrderMatchingEngine::new(
+        option.clone(),
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L1_MBP,
+        OmsType::Netting,
+        AccountType::Cash,
+        clock,
+        cache.clone(),
+        OrderMatchingEngineConfig::default(),
+    );
+    matching_engine.set_event_handler(Rc::new(move |event| {
+        if !process_events_for_handler.get() {
+            return;
+        }
+
+        if let Some(remaining) = fills_remaining_for_handler.get()
+            && matches!(event, OrderEventAny::Filled(_))
+            && remaining == 0
+        {
+            process_events_for_handler.set(false);
+            return;
+        }
+
+        execution_engine_for_handler.borrow_mut().process(&event);
+        if let Some(remaining) = fills_remaining_for_handler.get()
+            && matches!(event, OrderEventAny::Filled(_))
+        {
+            let remaining = remaining - 1;
+            fills_remaining_for_handler.set(Some(remaining));
+            if remaining == 0 {
+                process_events_for_handler.set(false);
+            }
+        }
+    }));
+
+    database_control.set_fail_add_order_on(fail_add_order_on);
+    matching_engine.iterate(expiration_ns, AggressorSide::NoAggressor);
+    database_control.set_fail_add_order_on(None);
+
+    let open_client_order_id =
+        settlement_client_order_id(&cache, &format!("EXPIRATION_{venue}_PHYSICAL_OPEN"));
+    assert_eq!(
+        cache
+            .borrow()
+            .position(&option_position.id)
+            .is_some_and(|position| position.is_closed()),
+        fills_before_crash == Some(1),
+        "The option position state must match the selected crash boundary",
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&open_client_order_id)
+            .map(|order| order.status()),
+        Some(if fail_add_order_on.is_some() {
+            OrderStatus::Initialized
+        } else {
+            OrderStatus::Accepted
+        }),
+        "The underlying delivery order must match the selected crash boundary",
+    );
+    assert!(
+        cache
+            .borrow()
+            .positions_open(None, Some(&underlying.id()), None, None, None)
+            .is_empty(),
+        "The first engine must stop before applying underlying delivery",
+    );
+
+    drop(matching_engine);
+    drop(execution_engine);
+    drop(cache);
+
+    let restarted_cache = Rc::new(RefCell::new(Cache::new(
+        None,
+        Some(Box::new(database_control.database())),
+    )));
+    {
+        let mut cache = restarted_cache.borrow_mut();
+        poll_ready(cache.cache_all()).unwrap();
+        cache.build_index();
+        cache
+            .add_trade(TradeTick::new(
+                underlying.id(),
+                Price::from("160.00"),
+                Quantity::from(1),
+                AggressorSide::NoAggressor,
+                TradeId::from("U-RESTART-2"),
+                UnixNanos::from(2),
+                UnixNanos::from(2),
+            ))
+            .unwrap();
+    }
+
+    let restarted_clock = Rc::new(RefCell::new(VirtualClock::new()));
+    restarted_clock.borrow_mut().set_time(expiration_ns);
+    let restarted_execution_engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        restarted_clock.clone(),
+        restarted_cache.clone(),
+        None,
+    )));
+    let restarted_execution_engine_for_handler = restarted_execution_engine.clone();
+    let mut restarted_matching_engine = OrderMatchingEngine::new(
+        option.clone(),
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L1_MBP,
+        OmsType::Netting,
+        AccountType::Cash,
+        restarted_clock,
+        restarted_cache.clone(),
+        OrderMatchingEngineConfig::default(),
+    );
+    restarted_matching_engine.set_event_handler(Rc::new(move |event| {
+        restarted_execution_engine_for_handler
+            .borrow_mut()
+            .process(&event);
+    }));
+
+    restarted_matching_engine.iterate(expiration_ns, AggressorSide::NoAggressor);
+
+    {
+        let restarted_cache = restarted_cache.borrow();
+        let underlying_positions = restarted_cache.positions_open(
+            None,
+            Some(&underlying.id()),
+            None,
+            Some(&account_id),
+            None,
+        );
+        assert_eq!(underlying_positions.len(), 1);
+        assert_eq!(underlying_positions[0].side, PositionSide::Long);
+        assert_eq!(underlying_positions[0].quantity, Quantity::from(1));
+        assert_eq!(underlying_positions[0].avg_px_open, 149.0);
+        assert_eq!(
+            restarted_cache
+                .order(&open_client_order_id)
+                .map(|order| order.status()),
+            Some(OrderStatus::Filled),
+        );
+    }
+
+    drop(restarted_matching_engine);
+    drop(restarted_execution_engine);
+    drop(restarted_cache);
+
+    let replayed_cache = Rc::new(RefCell::new(Cache::new(
+        None,
+        Some(Box::new(database_control.database())),
+    )));
+    {
+        let mut cache = replayed_cache.borrow_mut();
+        poll_ready(cache.cache_all()).unwrap();
+        cache.build_index();
+    }
+    let replayed_clock = Rc::new(RefCell::new(VirtualClock::new()));
+    replayed_clock.borrow_mut().set_time(expiration_ns);
+    let replayed_execution_engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        replayed_clock.clone(),
+        replayed_cache.clone(),
+        None,
+    )));
+    let replayed_execution_engine_for_handler = replayed_execution_engine;
+    let mut replayed_matching_engine = OrderMatchingEngine::new(
+        option,
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L1_MBP,
+        OmsType::Netting,
+        AccountType::Cash,
+        replayed_clock,
+        replayed_cache.clone(),
+        OrderMatchingEngineConfig::default(),
+    );
+    replayed_matching_engine.set_event_handler(Rc::new(move |event| {
+        replayed_execution_engine_for_handler
+            .borrow_mut()
+            .process(&event);
+    }));
+
+    replayed_matching_engine.iterate(expiration_ns, AggressorSide::NoAggressor);
+
+    let replayed_cache = replayed_cache.borrow();
+    let underlying_positions =
+        replayed_cache.positions_open(None, Some(&underlying.id()), None, Some(&account_id), None);
+    assert_eq!(
+        underlying_positions.len(),
+        1,
+        "A later restart must not duplicate completed physical delivery",
+    );
+    assert_eq!(underlying_positions[0].quantity, Quantity::from(1));
 }
 
 #[rstest]
@@ -14466,7 +14765,8 @@ fn run_otm_expiry_case(
     close_price: Option<Price>,
     expected_close_price: Price,
     account_id: AccountId,
-) {
+    use_random_ids: bool,
+) -> [String; 3] {
     let cache = Rc::new(RefCell::new(Cache::default()));
     let order_event_handler = order_event_handler_with_cache(cache.clone());
 
@@ -14515,7 +14815,10 @@ fn run_otm_expiry_case(
         AccountType::Cash,
         clock,
         cache.clone(),
-        OrderMatchingEngineConfig::default(),
+        OrderMatchingEngineConfig {
+            use_random_ids,
+            ..Default::default()
+        },
     );
 
     if let Some(close_price) = close_price {
@@ -14532,7 +14835,8 @@ fn run_otm_expiry_case(
 
     let events = get_order_event_handler_messages(&order_event_handler);
     let client_order_id = settlement_client_order_id(&cache, &format!("EXPIRATION_{venue}_OTM"));
-    assert_full_width_independent_settlement_ids(&events, client_order_id, venue);
+    let settlement_ids =
+        assert_full_width_independent_settlement_ids(&events, client_order_id, venue);
     let fills: Vec<OrderFilled> = events
         .into_iter()
         .filter_map(|e| match e {
@@ -14557,6 +14861,8 @@ fn run_otm_expiry_case(
         1,
         "OTM path must emit exactly one settlement fill"
     );
+
+    settlement_ids
 }
 
 #[rstest]
@@ -14575,11 +14881,94 @@ fn test_option_otm_expiry_does_not_exercise(
     #[case] expected_close_price: Price,
     account_id: AccountId,
 ) {
-    run_otm_expiry_case(kind, spot, close_price, expected_close_price, account_id);
+    run_otm_expiry_case(
+        kind,
+        spot,
+        close_price,
+        expected_close_price,
+        account_id,
+        false,
+    );
 }
 
 #[rstest]
-fn test_option_cash_settlement_put_pays_strike_minus_spot(account_id: AccountId) {
+fn test_option_otm_expiry_ids_stable_across_replay(account_id: AccountId) {
+    let first = run_otm_expiry_case(
+        OptionKind::Call,
+        Price::from("140.00"),
+        None,
+        Price::from("0.00"),
+        account_id,
+        false,
+    );
+    let second = run_otm_expiry_case(
+        OptionKind::Call,
+        Price::from("140.00"),
+        None,
+        Price::from("0.00"),
+        account_id,
+        false,
+    );
+
+    assert_eq!(first, second);
+    assert_eq!(
+        first,
+        [
+            "91429668-6417-53e6-bd98-08755707fcb0",
+            "6aec4bca-c37b-5adc-9bf2-31ca5152eb52",
+            "c66d230e-47f0-5d68-ac0f-b84db0382f46",
+        ],
+    );
+}
+
+#[rstest]
+fn test_option_otm_expiry_ids_random_when_configured(account_id: AccountId) {
+    let first = run_otm_expiry_case(
+        OptionKind::Call,
+        Price::from("140.00"),
+        None,
+        Price::from("0.00"),
+        account_id,
+        true,
+    );
+    let second = run_otm_expiry_case(
+        OptionKind::Call,
+        Price::from("140.00"),
+        None,
+        Price::from("0.00"),
+        account_id,
+        true,
+    );
+
+    assert_ne!(first, second);
+}
+
+#[rstest]
+fn test_option_otm_expiry_ids_are_scoped_by_account(account_id: AccountId) {
+    let first = run_otm_expiry_case(
+        OptionKind::Call,
+        Price::from("140.00"),
+        None,
+        Price::from("0.00"),
+        account_id,
+        false,
+    );
+    let second = run_otm_expiry_case(
+        OptionKind::Call,
+        Price::from("140.00"),
+        None,
+        Price::from("0.00"),
+        AccountId::from("SIM-002"),
+        false,
+    );
+
+    assert!(
+        first.iter().zip(second).all(|(lhs, rhs)| lhs != &rhs),
+        "Every settlement identifier must be scoped by account",
+    );
+}
+
+fn run_option_cash_settlement_case(account_id: AccountId) -> [String; 3] {
     let cache = Rc::new(RefCell::new(Cache::default()));
     let order_event_handler = order_event_handler_with_cache(cache.clone());
 
@@ -14637,7 +15026,10 @@ fn test_option_cash_settlement_put_pays_strike_minus_spot(account_id: AccountId)
     engine.iterate(expiration_ns, AggressorSide::NoAggressor);
 
     let client_order_id = settlement_client_order_id(&cache, &format!("EXPIRATION_{venue}_CASH"));
-    let settlement_fill = get_order_event_handler_messages(&order_event_handler)
+    let events = get_order_event_handler_messages(&order_event_handler);
+    let settlement_ids =
+        assert_full_width_independent_settlement_ids(&events, client_order_id, venue);
+    let settlement_fill = events
         .into_iter()
         .find_map(|e| match e {
             OrderEventAny::Filled(f) if f.client_order_id == client_order_id => Some(f),
@@ -14650,6 +15042,21 @@ fn test_option_cash_settlement_put_pays_strike_minus_spot(account_id: AccountId)
     assert_eq!(settlement_fill.last_qty, position.quantity);
     assert_eq!(settlement_fill.last_px, Price::from("9.00"));
     assert_eq!(settlement_fill.position_id, Some(position.id));
+
+    settlement_ids
+}
+
+#[rstest]
+fn test_option_cash_settlement_put_pays_strike_minus_spot(account_id: AccountId) {
+    run_option_cash_settlement_case(account_id);
+}
+
+#[rstest]
+fn test_option_cash_settlement_ids_stable_across_replay(account_id: AccountId) {
+    let first = run_option_cash_settlement_case(account_id);
+    let second = run_option_cash_settlement_case(account_id);
+
+    assert_eq!(first, second);
 }
 
 #[rstest]

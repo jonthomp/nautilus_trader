@@ -16,7 +16,8 @@
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     enums::{
-        LiquiditySide, OptionKind, OrderSide, OrderType, PositionSide, PriceType, TimeInForce,
+        LiquiditySide, OptionKind, OrderSide, OrderStatus, OrderType, PositionSide, PriceType,
+        TimeInForce,
     },
     events::{OrderEventAny, OrderFilled},
     identifiers::{ClientOrderId, InstrumentId, TradeId, VenueOrderId},
@@ -27,12 +28,21 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 use ustr::Ustr;
+use uuid::Uuid;
 
 use super::OrderMatchingEngine;
+
+// FNV-1a 64-bit constants (see http://www.isthe.com/chongo/tech/comp/fnv/).
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0100_0000_01b3;
 
 impl OrderMatchingEngine {
     pub(super) fn process_option_expiry(&mut self, ts_now: UnixNanos) -> anyhow::Result<bool> {
         let instrument_id = self.instrument.id();
+
+        if !self.option_resume_pending_physical_deliveries(ts_now)? {
+            return Ok(false);
+        }
 
         let positions: Vec<Position> = {
             let cache = self.cache.borrow();
@@ -114,6 +124,122 @@ impl OrderMatchingEngine {
         Ok(true)
     }
 
+    fn option_resume_pending_physical_deliveries(
+        &mut self,
+        ts_now: UnixNanos,
+    ) -> anyhow::Result<bool> {
+        if self.config.use_random_ids {
+            return Ok(true);
+        }
+
+        let instrument_id = self.instrument.id();
+        let positions: Vec<Position> = {
+            let cache = self.cache.borrow();
+            cache
+                .positions(None, Some(&instrument_id), None, None, None)
+                .into_iter()
+                .map(|position| position.cloned())
+                .collect()
+        };
+
+        for position in positions {
+            // Physical settlement closes the option before opening the underlying,
+            // so restart recovery must also inspect closed source positions.
+            if !position.is_closed() {
+                continue;
+            }
+
+            let (close_client_order_id, _, _) =
+                self.option_settlement_ids(&position, "physical-close");
+            let (open_client_order_id, generated_venue_order_id, trade_id) =
+                self.option_settlement_ids(&position, "physical-open");
+            let (close_complete, open_order) = {
+                let cache = self.cache.borrow();
+                let close_complete = cache
+                    .order(&close_client_order_id)
+                    .is_some_and(|order| order.status() == OrderStatus::Filled);
+                let open_order = cache
+                    .order(&open_client_order_id)
+                    .map(|order| order.clone());
+                (close_complete, open_order)
+            };
+
+            if !close_complete {
+                continue;
+            }
+
+            let Some(open_order) = open_order else {
+                continue;
+            };
+
+            if open_order.status() == OrderStatus::Filled {
+                continue;
+            }
+
+            let underlying_instrument = {
+                let cache = self.cache.borrow();
+                cache.instrument(&open_order.instrument_id()).cloned()
+            };
+            let Some(underlying_instrument) = underlying_instrument else {
+                return Ok(self.option_settlement_retry(
+                    "missing-underlying-instrument",
+                    &format!(
+                        "No underlying instrument {} for pending physical option settlement {}",
+                        open_order.instrument_id(),
+                        open_order.client_order_id(),
+                    ),
+                ));
+            };
+
+            self.account_ids
+                .insert(position.trader_id, position.account_id);
+            let venue_order_id = open_order
+                .venue_order_id()
+                .unwrap_or(generated_venue_order_id);
+
+            match open_order.status() {
+                OrderStatus::Initialized => {
+                    self.generate_order_accepted(&open_order, venue_order_id);
+                }
+                OrderStatus::Accepted => {}
+                status => {
+                    anyhow::bail!(
+                        "cannot resume physical option settlement order {} from status {status}",
+                        open_order.client_order_id(),
+                    );
+                }
+            }
+
+            let fill = OrderFilled::new(
+                open_order.trader_id(),
+                open_order.strategy_id(),
+                open_order.instrument_id(),
+                open_order.client_order_id(),
+                venue_order_id,
+                position.account_id,
+                trade_id,
+                open_order.order_side(),
+                open_order.order_type(),
+                open_order.quantity(),
+                self.instrument
+                    .strike_price()
+                    .expect("physical option settlement requires a strike price"),
+                underlying_instrument.quote_currency(),
+                LiquiditySide::Taker,
+                UUID4::new(),
+                ts_now,
+                ts_now,
+                false,
+                None,
+                Some(Money::zero(underlying_instrument.quote_currency())),
+                None,
+            );
+            self.dispatch_order_event(OrderEventAny::Filled(fill));
+        }
+
+        Ok(true)
+    }
+
     fn option_settlement_retry(&mut self, reason: &'static str, message: &str) -> bool {
         if self.option_settlement_warning != Some(reason) {
             log::warn!("{message}; settlement will retry");
@@ -159,15 +285,24 @@ impl OrderMatchingEngine {
         }
 
         for leg in &plan.legs {
-            self.publish_order_initialized(&leg.order);
+            let order = self.option_cached_settlement_order(leg)?;
+            if order.status() == OrderStatus::Initialized {
+                self.publish_order_initialized(&order);
+            }
         }
 
         for leg in &plan.legs {
-            self.generate_order_accepted(&leg.order, leg.fill.venue_order_id);
+            let order = self.option_cached_settlement_order(leg)?;
+            if order.status() == OrderStatus::Initialized {
+                self.generate_order_accepted(&order, leg.fill.venue_order_id);
+            }
         }
 
         for leg in plan.legs {
-            self.dispatch_order_event(OrderEventAny::Filled(leg.fill));
+            let order = self.option_cached_settlement_order(&leg)?;
+            if order.status() != OrderStatus::Filled {
+                self.dispatch_order_event(OrderEventAny::Filled(leg.fill));
+            }
         }
 
         Ok(())
@@ -177,11 +312,21 @@ impl OrderMatchingEngine {
         for leg in &plan.legs {
             let client_order_id = leg.order.client_order_id();
             let mut cache = self.cache.borrow_mut();
-            cache
-                .add_order(leg.order.clone(), leg.fill.position_id, None, false)
-                .map_err(|e| {
-                    anyhow::anyhow!("cannot add settlement order {client_order_id}: {e}")
-                })?;
+            if let Some(existing) = cache.order(&client_order_id) {
+                anyhow::ensure!(
+                    existing.instrument_id() == leg.order.instrument_id()
+                        && existing.order_side() == leg.order.order_side()
+                        && existing.quantity() == leg.order.quantity()
+                        && existing.is_reduce_only() == leg.order.is_reduce_only(),
+                    "existing settlement order {client_order_id} conflicts with the recovered plan",
+                );
+            } else {
+                cache
+                    .add_order(leg.order.clone(), leg.fill.position_id, None, false)
+                    .map_err(|e| {
+                        anyhow::anyhow!("cannot add settlement order {client_order_id}: {e}")
+                    })?;
+            }
             cache
                 .add_venue_order_id(&client_order_id, &leg.fill.venue_order_id, false)
                 .map_err(|e| {
@@ -192,6 +337,18 @@ impl OrderMatchingEngine {
                 })?;
         }
         Ok(())
+    }
+
+    fn option_cached_settlement_order(
+        &self,
+        leg: &OptionSettlementLeg,
+    ) -> anyhow::Result<OrderAny> {
+        let client_order_id = leg.order.client_order_id();
+        self.cache
+            .borrow()
+            .order(&client_order_id)
+            .map(|order| order.clone())
+            .ok_or_else(|| anyhow::anyhow!("settlement order {client_order_id} is not cached"))
     }
 
     fn option_should_exercise(&self, underlying_price: Price) -> bool {
@@ -260,9 +417,8 @@ impl OrderMatchingEngine {
         option_close_price: Option<Price>,
     ) -> OptionSettlementLeg {
         let venue = self.venue;
-        let client_order_id = ClientOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new()));
-        let venue_order_id = VenueOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new()));
-        let trade_id = TradeId::from(UUID4::new().to_string());
+        let (client_order_id, venue_order_id, trade_id) =
+            self.option_settlement_ids(position, "cash");
         let close_px = option_close_price
             .unwrap_or_else(|| self.option_settlement_price(underlying_price, true));
         let close_side = OrderCore::closing_side(position.side)
@@ -313,16 +469,10 @@ impl OrderMatchingEngine {
         };
 
         let venue = self.venue;
-        let close_client_order_id =
-            ClientOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new()));
-        let close_venue_order_id =
-            VenueOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new()));
-        let close_trade_id = TradeId::from(UUID4::new().to_string());
-        let open_client_order_id =
-            ClientOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new()));
-        let open_venue_order_id =
-            VenueOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new()));
-        let open_trade_id = TradeId::from(UUID4::new().to_string());
+        let (close_client_order_id, close_venue_order_id, close_trade_id) =
+            self.option_settlement_ids(position, "physical-close");
+        let (open_client_order_id, open_venue_order_id, open_trade_id) =
+            self.option_settlement_ids(position, "physical-open");
         let settlement_px = self.option_settlement_price(underlying_price, false);
         let option_close_px =
             option_close_price.unwrap_or_else(|| Price::zero(self.instrument.price_precision()));
@@ -390,9 +540,8 @@ impl OrderMatchingEngine {
         option_close_price: Option<Price>,
     ) -> OptionSettlementLeg {
         let venue = self.venue;
-        let client_order_id = ClientOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new()));
-        let venue_order_id = VenueOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new()));
-        let trade_id = TradeId::from(UUID4::new().to_string());
+        let (client_order_id, venue_order_id, trade_id) =
+            self.option_settlement_ids(position, "otm");
         let close_px =
             option_close_price.unwrap_or_else(|| Price::zero(self.instrument.price_precision()));
         let close_side = OrderCore::closing_side(position.side)
@@ -415,6 +564,58 @@ impl OrderMatchingEngine {
             ts_now,
         );
         OptionSettlementLeg { order, fill }
+    }
+
+    fn option_settlement_ids(
+        &self,
+        position: &Position,
+        leg_role: &str,
+    ) -> (ClientOrderId, VenueOrderId, TradeId) {
+        let venue = self.venue;
+
+        if self.config.use_random_ids {
+            return (
+                ClientOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new())),
+                VenueOrderId::from(format!("EXPIRATION-{venue}-{}", UUID4::new())),
+                TradeId::from(UUID4::new().to_string()),
+            );
+        }
+
+        let client_uuid = self.option_settlement_uuid(position, leg_role, "client-order");
+        let venue_uuid = self.option_settlement_uuid(position, leg_role, "venue-order");
+        let trade_uuid = self.option_settlement_uuid(position, leg_role, "trade");
+        (
+            ClientOrderId::from(format!("EXPIRATION-{venue}-{client_uuid}")),
+            VenueOrderId::from(format!("EXPIRATION-{venue}-{venue_uuid}")),
+            TradeId::from(trade_uuid),
+        )
+    }
+
+    fn option_settlement_uuid(&self, position: &Position, leg_role: &str, id_role: &str) -> String {
+        let instrument_id = self.instrument.id().to_string();
+        let expiration_ns = self
+            .instrument
+            .expiration_ns()
+            .expect("option settlement requires an expiration timestamp")
+            .as_u64()
+            .to_le_bytes();
+        let ts_opened = position.ts_opened.as_u64().to_le_bytes();
+
+        // Side, quantity and status can change when the close fill is applied,
+        // so the restart key contains only immutable settlement identity fields.
+        let parts = [
+            position.account_id.as_str().as_bytes(),
+            position.trader_id.as_str().as_bytes(),
+            position.strategy_id.as_str().as_bytes(),
+            instrument_id.as_bytes(),
+            position.id.as_str().as_bytes(),
+            position.opening_order_id.as_str().as_bytes(),
+            &ts_opened,
+            &expiration_ns,
+            leg_role.as_bytes(),
+            id_role.as_bytes(),
+        ];
+        deterministic_option_settlement_uuid(&parts)
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -539,4 +740,37 @@ struct OptionSettlementLeg {
 
 struct OptionSettlementPlan {
     legs: Vec<OptionSettlementLeg>,
+}
+
+fn deterministic_option_settlement_uuid(parts: &[&[u8]]) -> String {
+    let primary = option_settlement_hash(b"option-settlement-v1", parts);
+    let secondary = option_settlement_hash(b"option-settlement-v1-alt", parts);
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&primary.to_be_bytes());
+    bytes[8..].copy_from_slice(&secondary.to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    Uuid::from_bytes(bytes).to_string()
+}
+
+fn option_settlement_hash(namespace: &[u8], parts: &[&[u8]]) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    update_option_settlement_hash(&mut hash, namespace);
+
+    for part in parts {
+        update_option_settlement_hash(&mut hash, part);
+    }
+
+    hash
+}
+
+fn update_option_settlement_hash(hash: &mut u64, bytes: &[u8]) {
+    for &byte in bytes {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    *hash ^= 0xff;
+    *hash = hash.wrapping_mul(FNV_PRIME);
 }

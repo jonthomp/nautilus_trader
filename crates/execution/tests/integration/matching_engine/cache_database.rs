@@ -33,9 +33,9 @@ use nautilus_model::{
         AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId,
         VenueOrderId,
     },
-    instruments::{InstrumentAny, SyntheticInstrument},
+    instruments::{Instrument, InstrumentAny, SyntheticInstrument},
     orderbook::OrderBook,
-    orders::OrderAny,
+    orders::{Order, OrderAny},
     position::Position,
     types::{Currency, Money},
 };
@@ -47,6 +47,15 @@ struct FailNthAddOrderState {
     fail_add_order_on: Option<usize>,
     fail_index_order_position: bool,
     add_order_calls: usize,
+    general: AHashMap<String, Bytes>,
+    instruments: AHashMap<InstrumentId, InstrumentAny>,
+    instrument_closes: AHashMap<InstrumentId, InstrumentClose>,
+    synthetics: AHashMap<InstrumentId, SyntheticInstrument>,
+    accounts: AHashMap<AccountId, AccountAny>,
+    orders: AHashMap<ClientOrderId, OrderAny>,
+    positions: AHashMap<PositionId, Position>,
+    order_position: AHashMap<ClientOrderId, PositionId>,
+    order_client: AHashMap<ClientOrderId, ClientId>,
     order_snapshots: Vec<OrderSnapshot>,
     position_snapshots: Vec<PositionSnapshot>,
 }
@@ -65,6 +74,12 @@ impl FailNthAddOrderDatabaseControl {
 
     pub(super) fn set_fail_index_order_position(&self, fail: bool) {
         self.state.lock().fail_index_order_position = fail;
+    }
+
+    pub(super) fn database(&self) -> FailNthAddOrderDatabase {
+        FailNthAddOrderDatabase {
+            control: self.clone(),
+        }
     }
 
     #[allow(dead_code, reason = "used by the sibling exec_engine test module")]
@@ -106,11 +121,22 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
     }
 
     async fn load_all(&self) -> anyhow::Result<CacheMap> {
-        Ok(CacheMap::default())
+        let state = self.control.state.lock();
+        Ok(CacheMap {
+            currencies: AHashMap::new(),
+            instruments: state.instruments.clone(),
+            instrument_closes: state.instrument_closes.clone(),
+            synthetics: state.synthetics.clone(),
+            accounts: state.accounts.clone(),
+            orders: state.orders.clone(),
+            positions: state.positions.clone(),
+            greeks: AHashMap::new(),
+            yield_curves: AHashMap::new(),
+        })
     }
 
     fn load(&self) -> anyhow::Result<AHashMap<String, Bytes>> {
-        Ok(AHashMap::new())
+        Ok(self.control.state.lock().general.clone())
     }
 
     async fn load_currencies(&self) -> anyhow::Result<AHashMap<Ustr, Currency>> {
@@ -118,37 +144,37 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
     }
 
     async fn load_instruments(&self) -> anyhow::Result<AHashMap<InstrumentId, InstrumentAny>> {
-        Ok(AHashMap::new())
+        Ok(self.control.state.lock().instruments.clone())
     }
 
     async fn load_instrument_closes(
         &self,
     ) -> anyhow::Result<AHashMap<InstrumentId, InstrumentClose>> {
-        Ok(AHashMap::new())
+        Ok(self.control.state.lock().instrument_closes.clone())
     }
 
     async fn load_synthetics(&self) -> anyhow::Result<AHashMap<InstrumentId, SyntheticInstrument>> {
-        Ok(AHashMap::new())
+        Ok(self.control.state.lock().synthetics.clone())
     }
 
     async fn load_accounts(&self) -> anyhow::Result<AHashMap<AccountId, AccountAny>> {
-        Ok(AHashMap::new())
+        Ok(self.control.state.lock().accounts.clone())
     }
 
     async fn load_orders(&self) -> anyhow::Result<AHashMap<ClientOrderId, OrderAny>> {
-        Ok(AHashMap::new())
+        Ok(self.control.state.lock().orders.clone())
     }
 
     async fn load_positions(&self) -> anyhow::Result<AHashMap<PositionId, Position>> {
-        Ok(AHashMap::new())
+        Ok(self.control.state.lock().positions.clone())
     }
 
     fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, PositionId>> {
-        Ok(AHashMap::new())
+        Ok(self.control.state.lock().order_position.clone())
     }
 
     fn load_index_order_client(&self) -> anyhow::Result<AHashMap<ClientOrderId, ClientId>> {
-        Ok(AHashMap::new())
+        Ok(self.control.state.lock().order_client.clone())
     }
 
     async fn load_currency(&self, _code: &Ustr) -> anyhow::Result<Option<Currency>> {
@@ -157,31 +183,55 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
 
     async fn load_instrument(
         &self,
-        _instrument_id: &InstrumentId,
+        instrument_id: &InstrumentId,
     ) -> anyhow::Result<Option<InstrumentAny>> {
-        Ok(None)
+        Ok(self
+            .control
+            .state
+            .lock()
+            .instruments
+            .get(instrument_id)
+            .cloned())
     }
 
     async fn load_synthetic(
         &self,
-        _instrument_id: &InstrumentId,
+        instrument_id: &InstrumentId,
     ) -> anyhow::Result<Option<SyntheticInstrument>> {
-        Ok(None)
+        Ok(self
+            .control
+            .state
+            .lock()
+            .synthetics
+            .get(instrument_id)
+            .cloned())
     }
 
-    async fn load_account(&self, _account_id: &AccountId) -> anyhow::Result<Option<AccountAny>> {
-        Ok(None)
+    async fn load_account(&self, account_id: &AccountId) -> anyhow::Result<Option<AccountAny>> {
+        Ok(self.control.state.lock().accounts.get(account_id).cloned())
     }
 
     async fn load_order(
         &self,
-        _client_order_id: &ClientOrderId,
+        client_order_id: &ClientOrderId,
     ) -> anyhow::Result<Option<OrderAny>> {
-        Ok(None)
+        Ok(self
+            .control
+            .state
+            .lock()
+            .orders
+            .get(client_order_id)
+            .cloned())
     }
 
-    async fn load_position(&self, _position_id: &PositionId) -> anyhow::Result<Option<Position>> {
-        Ok(None)
+    async fn load_position(&self, position_id: &PositionId) -> anyhow::Result<Option<Position>> {
+        Ok(self
+            .control
+            .state
+            .lock()
+            .positions
+            .get(position_id)
+            .cloned())
     }
 
     fn load_actor(&self, _actor_id: &ActorId) -> anyhow::Result<AHashMap<String, Bytes>> {
@@ -233,7 +283,8 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
         Ok(Vec::new())
     }
 
-    fn add(&self, _key: String, _value: Bytes) -> anyhow::Result<()> {
+    fn add(&self, key: String, value: Bytes) -> anyhow::Result<()> {
+        self.control.state.lock().general.insert(key, value);
         Ok(())
     }
 
@@ -241,27 +292,53 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
         Ok(())
     }
 
-    fn add_instrument(&self, _instrument: &InstrumentAny) -> anyhow::Result<()> {
+    fn add_instrument(&self, instrument: &InstrumentAny) -> anyhow::Result<()> {
+        self.control
+            .state
+            .lock()
+            .instruments
+            .insert(instrument.id(), instrument.clone());
         Ok(())
     }
 
-    fn add_instrument_close(&self, _close: &InstrumentClose) -> anyhow::Result<()> {
+    fn add_instrument_close(&self, close: &InstrumentClose) -> anyhow::Result<()> {
+        self.control
+            .state
+            .lock()
+            .instrument_closes
+            .insert(close.instrument_id, *close);
         Ok(())
     }
 
-    fn add_synthetic(&self, _synthetic: &SyntheticInstrument) -> anyhow::Result<()> {
+    fn add_synthetic(&self, synthetic: &SyntheticInstrument) -> anyhow::Result<()> {
+        self.control
+            .state
+            .lock()
+            .synthetics
+            .insert(synthetic.id, synthetic.clone());
         Ok(())
     }
 
-    fn add_account(&self, _account: &AccountAny) -> anyhow::Result<()> {
+    fn add_account(&self, account: &AccountAny) -> anyhow::Result<()> {
+        self.control
+            .state
+            .lock()
+            .accounts
+            .insert(account.id(), account.clone());
         Ok(())
     }
 
-    fn add_order(&self, _order: &OrderAny, _client_id: Option<ClientId>) -> anyhow::Result<()> {
+    fn add_order(&self, order: &OrderAny, client_id: Option<ClientId>) -> anyhow::Result<()> {
         let mut state = self.control.state.lock();
         state.add_order_calls += 1;
         if state.fail_add_order_on == Some(state.add_order_calls) {
             anyhow::bail!("test add order failure");
+        }
+        state.orders.insert(order.client_order_id(), order.clone());
+        if let Some(client_id) = client_id {
+            state
+                .order_client
+                .insert(order.client_order_id(), client_id);
         }
         Ok(())
     }
@@ -270,7 +347,12 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
         Ok(())
     }
 
-    fn add_position(&self, _position: &Position) -> anyhow::Result<()> {
+    fn add_position(&self, position: &Position) -> anyhow::Result<()> {
+        self.control
+            .state
+            .lock()
+            .positions
+            .insert(position.id, position.clone());
         Ok(())
     }
 
@@ -322,11 +404,16 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
         Ok(())
     }
 
-    fn delete_order(&self, _client_order_id: &ClientOrderId) -> anyhow::Result<()> {
+    fn delete_order(&self, client_order_id: &ClientOrderId) -> anyhow::Result<()> {
+        let mut state = self.control.state.lock();
+        state.orders.remove(client_order_id);
+        state.order_position.remove(client_order_id);
+        state.order_client.remove(client_order_id);
         Ok(())
     }
 
-    fn delete_position(&self, _position_id: &PositionId) -> anyhow::Result<()> {
+    fn delete_position(&self, position_id: &PositionId) -> anyhow::Result<()> {
+        self.control.state.lock().positions.remove(position_id);
         Ok(())
     }
 
@@ -344,12 +431,15 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
 
     fn index_order_position(
         &self,
-        _client_order_id: ClientOrderId,
-        _position_id: PositionId,
+        client_order_id: ClientOrderId,
+        position_id: PositionId,
     ) -> anyhow::Result<()> {
-        if self.control.state.lock().fail_index_order_position {
+        let mut state = self.control.state.lock();
+        if state.fail_index_order_position {
             anyhow::bail!("index order position failed");
         }
+
+        state.order_position.insert(client_order_id, position_id);
 
         Ok(())
     }
@@ -370,15 +460,32 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
         Ok(())
     }
 
-    fn update_account(&self, _account: &AccountAny) -> anyhow::Result<()> {
+    fn update_account(&self, account: &AccountAny) -> anyhow::Result<()> {
+        self.control
+            .state
+            .lock()
+            .accounts
+            .insert(account.id(), account.clone());
         Ok(())
     }
 
-    fn update_order(&self, _order_event: &OrderEventAny) -> anyhow::Result<()> {
+    fn update_order(&self, order_event: &OrderEventAny) -> anyhow::Result<()> {
+        let client_order_id = order_event.client_order_id();
+        let mut state = self.control.state.lock();
+        let order = state
+            .orders
+            .get_mut(&client_order_id)
+            .ok_or_else(|| anyhow::anyhow!("order {client_order_id} not found"))?;
+        order.apply(order_event.clone())?;
         Ok(())
     }
 
-    fn update_position(&self, _position: &Position) -> anyhow::Result<()> {
+    fn update_position(&self, position: &Position) -> anyhow::Result<()> {
+        self.control
+            .state
+            .lock()
+            .positions
+            .insert(position.id, position.clone());
         Ok(())
     }
 
