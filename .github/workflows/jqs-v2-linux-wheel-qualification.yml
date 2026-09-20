@@ -1,0 +1,368 @@
+name: JQS v2 Linux wheel qualification
+
+on:
+  push:
+    branches:
+      - feat/jqs-v2-linux-wheel-build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_COMMIT: 120ae439787de3873063236cfd9186026f2f01f2
+  SOURCE_DATE_EPOCH: "1789860278"
+  CARGO_BUILD_JOBS: "2"
+  RUST_TOOLCHAIN: 1.98.1
+  UV_VERSION: 0.12.13
+  MATURIN_VERSION: 1.15.0
+  PYTHON_VERSION: 3.12.13
+
+jobs:
+  build:
+    name: Build ${{ matrix.iteration }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        iteration:
+          - 1
+          - 2
+    steps:
+      - name: Check out exact source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          persist-credentials: false
+
+      - name: Verify source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --short)"
+          {
+            printf 'source_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'source_tree=%s\n' "$(git rev-parse 'HEAD^{tree}')"
+            printf 'source_epoch=%s\n' "$SOURCE_DATE_EPOCH"
+            git show -s --format='source_commit_time=%cI%nsource_subject=%s' HEAD
+          } > "$RUNNER_TEMP/source-identity.txt"
+
+      - name: Set up CPython
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv without cache
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      - name: Install native build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            capnproto \
+            clang \
+            libcapnp-dev \
+            lld \
+            make \
+            patchelf \
+            pkg-config
+          df -h /
+
+      - name: Install and verify pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" \
+            --profile minimal \
+            --component llvm-tools-preview
+          rustup default "$RUST_TOOLCHAIN"
+          sysroot="$(rustc --print sysroot)"
+          printf 'LD_LIBRARY_PATH=%s/lib\n' "$sysroot" >> "$GITHUB_ENV"
+          export LD_LIBRARY_PATH="$sysroot/lib"
+          host="$(rustc --version --verbose | awk '/^host:/ { print $2 }')"
+          objcopy="$sysroot/lib/rustlib/$host/bin/rust-objcopy"
+          test -x "$objcopy"
+          "$objcopy" --version
+          {
+            uname -a
+            python --version
+            uv --version
+            rustc --version --verbose
+            cargo --version --verbose
+            "$objcopy" --version
+            clang --version
+            ldd --version | head -n 1
+          } > "$RUNNER_TEMP/toolchain.txt" 2>&1
+
+      - name: Build wheel from clean output
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/cargo-target-${{ matrix.iteration }}"
+          dist="$RUNNER_TEMP/dist-${{ matrix.iteration }}"
+          test ! -e "$target"
+          test ! -e "$dist"
+          mkdir -p "$target" "$dist"
+          export CARGO_TARGET_DIR="$target"
+          PYO3_PYTHON="$(command -v python)"
+          export PYO3_PYTHON
+          cd python
+          uv run --python "$PYO3_PYTHON" --no-project --no-build \
+            --with "maturin==$MATURIN_VERSION" -- \
+            maturin build --locked --release \
+              --interpreter "$PYO3_PYTHON" \
+              --out "$dist" 2>&1 | tee "$RUNNER_TEMP/build.log"
+          if grep -Eqi \
+            'failed to strip|rust-objcopy.*(error|failed)|libLLVM.*not (loaded|found)|cannot open shared object file' \
+            "$RUNNER_TEMP/build.log"; then
+            printf 'fatal: stripping warning detected\n' >&2
+            exit 1
+          fi
+          test "$(find "$dist" -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1
+          test -z "$(git status --short)"
+
+      - name: Inspect wheel and reject build-path residue
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/dist-${{ matrix.iteration }}"
+          wheel="$(find "$dist" -maxdepth 1 -type f -name '*.whl')"
+          inspect="$RUNNER_TEMP/inspect-${{ matrix.iteration }}"
+          mkdir -p "$inspect"
+          python - "$wheel" "$inspect" "$RUNNER_TEMP/evidence.json" <<'PY'
+          import email
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+          import zipfile
+
+          wheel_path = Path(sys.argv[1])
+          inspect_dir = Path(sys.argv[2])
+          evidence_path = Path(sys.argv[3])
+          expected_time = (2026, 9, 19, 23, 24, 38)
+
+          with zipfile.ZipFile(wheel_path) as archive:
+              infos = archive.infolist()
+              if not infos:
+                  raise SystemExit("wheel is empty")
+              if any(info.date_time != expected_time for info in infos):
+                  raise SystemExit("wheel contains a timestamp outside SOURCE_DATE_EPOCH")
+              native_info = next(info for info in infos if info.filename.endswith(".so"))
+              native_data = archive.read(native_info)
+              native_path = inspect_dir / Path(native_info.filename).name
+              native_path.write_bytes(native_data)
+              metadata_info = next(
+                  info for info in infos if info.filename.endswith(".dist-info/METADATA")
+              )
+              wheel_info = next(
+                  info for info in infos if info.filename.endswith(".dist-info/WHEEL")
+              )
+              metadata = email.message_from_bytes(archive.read(metadata_info))
+              wheel_metadata = email.message_from_bytes(archive.read(wheel_info))
+              if metadata["Name"] != "nautilus-trader":
+                  raise SystemExit("unexpected package name")
+              if metadata["Version"] != "2.0.0rc6":
+                  raise SystemExit("unexpected package version")
+              tags = wheel_metadata.get_all("Tag") or []
+              if len(tags) != 1 or not tags[0].startswith("cp312-cp312-manylinux_"):
+                  raise SystemExit(f"unexpected wheel tag: {tags}")
+              members = []
+              for info in infos:
+                  data = archive.read(info.filename)
+                  members.append(
+                      {
+                          "name": info.filename,
+                          "sha256": hashlib.sha256(data).hexdigest(),
+                          "size": info.file_size,
+                          "compressed_size": info.compress_size,
+                          "crc": f"{info.CRC:08x}",
+                          "timestamp": list(info.date_time),
+                          "external_attr": info.external_attr,
+                          "extra": info.extra.hex(),
+                          "comment": info.comment.hex(),
+                          "compression": info.compress_type,
+                      }
+                  )
+          evidence = {
+              "filename": wheel_path.name,
+              "size": wheel_path.stat().st_size,
+              "sha256": hashlib.sha256(wheel_path.read_bytes()).hexdigest(),
+              "name": metadata["Name"],
+              "version": metadata["Version"],
+              "requires_python": metadata["Requires-Python"],
+              "generator": wheel_metadata["Generator"],
+              "tags": tags,
+              "native_filename": native_info.filename,
+              "native_size": len(native_data),
+              "native_sha256": hashlib.sha256(native_data).hexdigest(),
+              "members": members,
+          }
+          evidence_path.write_text(json.dumps(evidence, indent=2) + "\n")
+          print(json.dumps({key: value for key, value in evidence.items() if key != "members"}))
+          PY
+          native="$(find "$inspect" -maxdepth 1 -type f -name '*.so')"
+          file "$native"
+          if strings -a "$native" | grep -F "$RUNNER_TEMP"; then
+            printf 'fatal: runner temporary path remains in native extension\n' >&2
+            exit 1
+          fi
+          if strings -a "$native" | grep -Eq '/release/deps/rustc[[:alnum:]]{6,}'; then
+            printf 'fatal: random rustc temporary path remains in native extension\n' >&2
+            exit 1
+          fi
+
+      - name: Stage independent build evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p "$stage/wheel" "$stage/evidence"
+          cp "$RUNNER_TEMP"/dist-${{ matrix.iteration }}/*.whl "$stage/wheel/"
+          cp "$RUNNER_TEMP/build.log" "$stage/evidence/build.log"
+          cp "$RUNNER_TEMP/evidence.json" "$stage/evidence/wheel.json"
+          cp "$RUNNER_TEMP/source-identity.txt" "$stage/evidence/source-identity.txt"
+          cp "$RUNNER_TEMP/toolchain.txt" "$stage/evidence/toolchain.txt"
+          sha256sum "$stage"/wheel/*.whl > "$stage/evidence/SHA256SUMS"
+
+      - name: Upload independent build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jqs-v2-linux-build-${{ matrix.iteration }}
+          path: ${{ runner.temp }}/stage
+          if-no-files-found: error
+          retention-days: 7
+
+  compare:
+    name: Compare and qualify
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Set up CPython
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Download build 1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: jqs-v2-linux-build-1
+          path: ${{ runner.temp }}/build-1
+
+      - name: Download build 2
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: jqs-v2-linux-build-2
+          path: ${{ runner.temp }}/build-2
+
+      - name: Prove byte and ZIP-structure reproducibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$RUNNER_TEMP/build-1" "$RUNNER_TEMP/build-2" "$RUNNER_TEMP/comparison.json" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+          import zipfile
+
+          roots = [Path(sys.argv[1]), Path(sys.argv[2])]
+          output = Path(sys.argv[3])
+          wheels = []
+          member_sets = []
+          for root in roots:
+              found = list(root.glob("wheel/*.whl"))
+              if len(found) != 1:
+                  raise SystemExit(f"expected one wheel under {root}, found {len(found)}")
+              wheel = found[0]
+              wheels.append(wheel)
+              with zipfile.ZipFile(wheel) as archive:
+                  member_sets.append(
+                      [
+                          {
+                              "name": info.filename,
+                              "sha256": hashlib.sha256(archive.read(info.filename)).hexdigest(),
+                              "size": info.file_size,
+                              "compressed_size": info.compress_size,
+                              "crc": f"{info.CRC:08x}",
+                              "timestamp": list(info.date_time),
+                              "external_attr": info.external_attr,
+                              "extra": info.extra.hex(),
+                              "comment": info.comment.hex(),
+                              "compression": info.compress_type,
+                          }
+                          for info in archive.infolist()
+                      ]
+                  )
+
+          wheel_bytes = [wheel.read_bytes() for wheel in wheels]
+          hashes = [hashlib.sha256(data).hexdigest() for data in wheel_bytes]
+          if wheel_bytes[0] != wheel_bytes[1]:
+              raise SystemExit(f"wheel bytes differ: {hashes}")
+          if member_sets[0] != member_sets[1]:
+              raise SystemExit("wheel member content/order/timestamps/attributes/compression differ")
+          build_evidence = [
+              json.loads((root / "evidence/wheel.json").read_text()) for root in roots
+          ]
+          if build_evidence[0] != build_evidence[1]:
+              raise SystemExit("independent evidence manifests differ")
+          result = {
+              "source_commit": "120ae439787de3873063236cfd9186026f2f01f2",
+              "source_date_epoch": 1789860278,
+              "filename": wheels[0].name,
+              "size": len(wheel_bytes[0]),
+              "sha256": hashes[0],
+              "native_size": build_evidence[0]["native_size"],
+              "native_sha256": build_evidence[0]["native_sha256"],
+              "member_count": len(member_sets[0]),
+              "byte_identical": True,
+              "member_structure_identical": True,
+          }
+          output.write_text(json.dumps(result, indent=2) + "\n")
+          print(json.dumps(result))
+          PY
+
+      - name: Install and import qualified wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel="$(find "$RUNNER_TEMP/build-1/wheel" -maxdepth 1 -type f -name '*.whl')"
+          python -m venv "$RUNNER_TEMP/verify-env"
+          "$RUNNER_TEMP/verify-env/bin/python" -m pip install --no-deps "$wheel"
+          "$RUNNER_TEMP/verify-env/bin/python" - <<'PY'
+          import nautilus_trader
+          import nautilus_trader._libnautilus
+
+          if nautilus_trader.__version__ != "2.0.0rc6":
+              raise SystemExit(f"unexpected imported version: {nautilus_trader.__version__}")
+          print(f"version={nautilus_trader.__version__}")
+          print(f"extension={nautilus_trader._libnautilus.__file__}")
+          PY
+
+      - name: Stage qualified wheel and evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/qualified"
+          mkdir -p "$stage/wheel" "$stage/evidence/build-1" "$stage/evidence/build-2"
+          cp "$RUNNER_TEMP"/build-1/wheel/*.whl "$stage/wheel/"
+          cp "$RUNNER_TEMP/comparison.json" "$stage/evidence/comparison.json"
+          cp -R "$RUNNER_TEMP/build-1/evidence/." "$stage/evidence/build-1/"
+          cp -R "$RUNNER_TEMP/build-2/evidence/." "$stage/evidence/build-2/"
+          sha256sum "$stage"/wheel/*.whl > "$stage/evidence/SHA256SUMS"
+
+      - name: Upload qualified wheel and evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jqs-v2-linux-qualified-120ae439
+          path: ${{ runner.temp }}/qualified
+          if-no-files-found: error
+          retention-days: 90
